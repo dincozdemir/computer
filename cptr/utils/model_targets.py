@@ -90,7 +90,10 @@ async def first_api_model_target(app_state=None) -> ApiModelTarget:
         if not conn.get("enabled", True):
             continue
         model_ids = conn.get("data", {}).get("models")
-        if not model_ids:
+        # Older bootstrap records can contain the sample value shipped by
+        # Computer. Never route a managed request to that placeholder: refresh
+        # from the provider instead.
+        if not model_ids or any(str(model).strip() == "YOUR_MODEL_ID" for model in model_ids):
             model_ids = await _fetch_provider_models(conn)
         if model_ids:
             prefix = (conn.get("prefix_id") or "").strip()

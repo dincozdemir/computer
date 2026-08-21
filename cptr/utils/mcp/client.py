@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 from copy import deepcopy
 import logging
+import os
 from contextlib import AsyncExitStack
 
 import anyio
@@ -84,10 +85,14 @@ class MCPClient:
         command = command.strip()
         if len(command) > 1 and command[0] == command[-1] and command[0] in ("'", '"'):
             command = command[1:-1]
+        # A configured server environment augments, rather than replaces, the
+        # runtime environment. Local tools commonly need HOME, PATH and macOS
+        # browser-launch context in addition to their explicit settings.
+        process_env = {**os.environ, **env} if env is not None else None
         params = StdioServerParameters(
             command=command,
             args=args or [],
-            env=env,
+            env=process_env,
             cwd=cwd,
         )
         async with AsyncExitStack() as exit_stack:

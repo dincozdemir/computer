@@ -44,6 +44,22 @@ CHAT_ID_HEADER = "X-Chat-Id"
 OWUI_CHAT_ID_HEADER = "X-OpenWebUI-Chat-Id"
 OWUI_MESSAGE_ID_HEADER = "X-OpenWebUI-Message-Id"
 OWUI_TASK_HEADER = "X-OpenWebUI-Task"
+DEFAULT_MANAGED_MODEL = {
+    "id": "cptr",
+    "name": "Open WebUI Computer",
+    "owner": "cptr",
+}
+
+
+async def _managed_model() -> dict[str, str]:
+    """Load the installer-configured model identity with safe public defaults."""
+    configured = await Config.get("gateway.managed_model")
+    if not isinstance(configured, dict):
+        return dict(DEFAULT_MANAGED_MODEL)
+    return {
+        key: str(configured.get(key) or default).strip() or default
+        for key, default in DEFAULT_MANAGED_MODEL.items()
+    }
 
 
 # ── API key management ───────────────────────────────────────
@@ -106,39 +122,26 @@ async def _authenticate(request: Request) -> str:
 
 @router.get("/models")
 async def list_models(request: Request):
-    """List workspaces as OpenAI-format models."""
+    """Expose the managed Computer workspace as one friendly model."""
     user_id = await _authenticate(request)
     workspaces = await Workspace.get_by_user(user_id)
+    if not workspaces:
+        return {"object": "list", "data": []}
 
-    # Disambiguate basenames
-    name_counts: dict[str, int] = {}
-    for ws in workspaces:
-        name = Path(ws.path).name
-        name_counts[name] = name_counts.get(name, 0) + 1
-
-    seen: dict[str, int] = {}
-    models = []
-    for ws in workspaces:
-        basename = Path(ws.path).name
-        if name_counts[basename] > 1:
-            seen[basename] = seen.get(basename, 0) + 1
-            model_id = f"cptr/{basename}-{seen[basename]}"
-        else:
-            model_id = f"cptr/{basename}"
-
-        models.append(
+    workspace = workspaces[0]
+    managed_model = await _managed_model()
+    return {
+        "object": "list",
+        "data": [
             {
-                "id": model_id,
+                "id": managed_model["id"],
                 "object": "model",
-                "created": ws.created_at or int(time.time()),
-                "owned_by": "cptr",
-                "name": f"{ws.name} - {ws.path}",
-                # Extra metadata for cptr
-                "cptr_workspace": ws.path,
+                "created": workspace.created_at or int(time.time()),
+                "owned_by": managed_model["owner"],
+                "name": managed_model["name"],
             }
-        )
-
-    return {"object": "list", "data": models}
+        ],
+    }
 
 
 # ── POST /v1/chat/completions ────────────────────────────────
@@ -594,7 +597,14 @@ async def _proxy_to_llm(
 
 
 async def _resolve_workspace(user_id: str, model_id: str) -> str:
-    """Resolve 'cptr/basename' → workspace filesystem path."""
+    """Resolve the configured managed model to its provisioned workspace."""
+    if model_id == (await _managed_model())["id"]:
+        workspaces = await Workspace.get_by_user(user_id)
+        if workspaces:
+            return workspaces[0].path
+        raise HTTPException(404, "No managed workspace is configured")
+
+    # Support IDs produced by older versions while existing chats migrate.
     if not model_id.startswith("cptr/"):
         raise HTTPException(400, f"Invalid model ID: {model_id}")
 

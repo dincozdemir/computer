@@ -617,25 +617,26 @@ async def _fetch_provider_models(conn: dict) -> list[str] | None:
 
         elif provider == "openai":
             url = (base_url or "https://api.openai.com/v1") + "/models"
-            async with httpx.AsyncClient(timeout=10) as client:
-                r = await client.get(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {api_key or ''}",
-                        **_openrouter_headers(url),
-                    },
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    models = [m["id"] for m in data.get("data", [])]
-                    log.info("Auto-discovered %d models from %s", len(models), url)
-                    return models
-                else:
-                    log.warning(
-                        "Model auto-discovery failed for %s: HTTP %d",
-                        url,
-                        r.status_code,
-                    )
+            headers = {
+                "Authorization": f"Bearer {api_key or ''}",
+                **_openrouter_headers(url),
+            }
+            for attempt in range(1, 4):
+                try:
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        r = await client.get(url, headers=headers)
+                    if r.status_code == 200:
+                        data = r.json()
+                        models = [m["id"] for m in data.get("data", [])]
+                        log.info("Auto-discovered %d models from %s", len(models), url)
+                        return models
+                    log.warning("Model auto-discovery failed for %s: HTTP %d", url, r.status_code)
+                    break
+                except httpx.HTTPError as error:
+                    if attempt == 3:
+                        raise error
+                    log.warning("Model auto-discovery attempt %d/3 failed for %s; retrying", attempt, url)
+                    await asyncio.sleep(attempt)
 
         else:
             log.warning("Unknown provider '%s', skipping model auto-discovery", provider)

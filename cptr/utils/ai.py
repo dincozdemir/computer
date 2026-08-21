@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import html
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -31,6 +33,114 @@ from cptr.env import (
 from cptr.utils.logger import log_upstream_request
 
 logger = logging.getLogger(__name__)
+
+_QWEN_XML_FUNCTION_RE = re.compile(
+    r"<function=(?P<name>[a-zA-Z0-9_.-]+)>\s*(?P<parameters>.*?)</function>\s*(?:</tool_call>)?",
+    re.DOTALL,
+)
+_QWEN_XML_PARAMETER_RE = re.compile(
+    r"<parameter=(?P<name>[a-zA-Z0-9_.-]+)>\s*(?P<value>.*?)</parameter>",
+    re.DOTALL,
+)
+_QWEN_XML_FUNCTION_MARKER = "<function="
+_TOOL_RESULT_CONTINUATION_MAX_CHARS = 18_000
+
+
+def _split_qwen_xml_marker(text: str) -> tuple[str, str]:
+    """Return text safe to display and a possible split ``<function=`` prefix.
+
+    SSE chunks are arbitrary: Qwen may emit ``<fun`` at the end of one chunk
+    and ``ction=tool>`` in the next.  Keep only the longest suffix which could
+    still become the marker so function markup never reaches the UI as text.
+    """
+    for length in range(min(len(text), len(_QWEN_XML_FUNCTION_MARKER) - 1), 0, -1):
+        suffix = text[-length:]
+        if _QWEN_XML_FUNCTION_MARKER.startswith(suffix):
+            return text[:-length], suffix
+    return text, ""
+
+
+def _parse_qwen_xml_tool_calls(text: str) -> tuple[list[dict], str]:
+    """Convert Qwen's text-form function markup to normalized tool calls."""
+    calls: list[dict] = []
+    for match in _QWEN_XML_FUNCTION_RE.finditer(text):
+        arguments: dict = {}
+        for parameter in _QWEN_XML_PARAMETER_RE.finditer(match.group("parameters")):
+            value = html.unescape(parameter.group("value")).strip()
+            if value.lower() in {"true", "false"}:
+                arguments[parameter.group("name")] = value.lower() == "true"
+            elif re.fullmatch(r"-?\d+", value):
+                arguments[parameter.group("name")] = int(value)
+            elif re.fullmatch(r"-?(?:\d+\.\d*|\d*\.\d+)", value):
+                arguments[parameter.group("name")] = float(value)
+            else:
+                try:
+                    arguments[parameter.group("name")] = json.loads(value)
+                except (TypeError, ValueError):
+                    arguments[parameter.group("name")] = value
+        calls.append(
+            {
+                "call_id": f"call_{uuid.uuid4().hex}",
+                "name": match.group("name"),
+                "arguments": arguments,
+            }
+        )
+    return calls, _QWEN_XML_FUNCTION_RE.sub("", text).strip()
+
+
+def _message_text(content: object) -> str:
+    """Return the text portion of an OpenAI-compatible message content value."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
+def _compact_tool_results_for_continuation(messages: list[dict]) -> str:
+    """Preserve useful tool output in a final synthesis request within context limits."""
+    results = [
+        _message_text(message.get("content", ""))
+        for message in messages
+        if message.get("role") == "tool"
+    ]
+    text = "\n\n".join(result for result in results if result).strip()
+    if len(text) <= _TOOL_RESULT_CONTINUATION_MAX_CHARS:
+        return text
+
+    # GitHub diffs can easily exceed a local model's context. Keep the start
+    # of every changed file rather than only the first few files, which gives
+    # the model a representative, file-by-file basis for its summary.
+    sections = re.split(r"(?=^diff --git )", text, flags=re.MULTILINE)
+    sections = [section for section in sections if section.strip()]
+    if len(sections) > 1:
+        per_section = max(800, _TOOL_RESULT_CONTINUATION_MAX_CHARS // len(sections))
+        compacted = "\n\n".join(section[:per_section] for section in sections)
+        return compacted[:_TOOL_RESULT_CONTINUATION_MAX_CHARS] + "\n\n[Diff truncated for context.]"
+    return text[:_TOOL_RESULT_CONTINUATION_MAX_CHARS] + "\n\n[Tool output truncated for context.]"
+
+
+def _tool_result_continuation(messages: list[dict]) -> str:
+    """Build a self-contained final-answer turn for broken Qwen tool loops."""
+    original_request = next(
+        (
+            _message_text(message.get("content", "")).strip()
+            for message in reversed(messages)
+            if message.get("role") == "user" and _message_text(message.get("content", "")).strip()
+        ),
+        "",
+    )
+    tool_results = _compact_tool_results_for_continuation(messages)
+    return (
+        "Answer the original request using the retrieved tool results below. "
+        "Do not call tools, do not claim the inputs are missing, and do not ask a question.\n\n"
+        f"Original request:\n{original_request}\n\n"
+        f"Retrieved tool results:\n{tool_results}"
+    )
 
 
 def _reasoning_output_item(text: str = "", *, status: str = "in_progress") -> dict:
@@ -665,6 +775,7 @@ async def stream_openai_completions(
     headers = {"Authorization": f"Bearer {key}", **_openrouter_headers(url)}
 
     emitted = False
+    tool_result_continuation_added = False
     for attempt in range(_STREAM_RETRY_ATTEMPTS):
         try:
             async with httpx.AsyncClient(timeout=_STREAM_TIMEOUT) as client:
@@ -683,8 +794,42 @@ async def stream_openai_completions(
                             "[stream] openai completions error body: %s",
                             error_body.decode(errors="replace"),
                         )
+                        # Qwen3.8's template requires a normal user turn after
+                        # tool output. Some Open WebUI-compatible proxy layers
+                        # additionally drop the preceding tool history during
+                        # that retry. Rebuild the request as one self-contained
+                        # synthesis turn so the original request and retrieved
+                        # result cannot disappear.
+                        if (
+                            resp.status_code == 400
+                            and not tool_result_continuation_added
+                            and b"no user query found in messages" in error_body.lower()
+                            and any(message.get("role") == "tool" for message in body["messages"])
+                        ):
+                            continuation = _tool_result_continuation(body["messages"])
+                            system_messages = [
+                                message
+                                for message in body["messages"]
+                                if message.get("role") == "system"
+                            ]
+                            body["messages"] = [
+                                *system_messages,
+                                {"role": "user", "content": continuation},
+                            ]
+                            # This is the final answer pass. Tool schemas are
+                            # unnecessary and would re-enable Qwen's fragile
+                            # multi-step tool template.
+                            body.pop("tools", None)
+                            tool_result_continuation_added = True
+                            logger.warning(
+                                "[stream] retrying a self-contained tool-result synthesis for Qwen"
+                            )
+                            continue
                     resp.raise_for_status()
                     tool_calls: dict[int, dict] = {}
+                    xml_tool_buffer = ""
+                    xml_tool_mode = False
+                    xml_marker_probe = ""
                     reasoning_buffer = ""
                     reasoning_item: dict | None = None
                     reasoning_details: list = []
@@ -744,8 +889,25 @@ async def stream_openai_completions(
                             if item is not None:
                                 emitted = True
                                 yield {"type": "output", "item": item}
-                            emitted = True
-                            yield {"type": "text_delta", "content": delta["content"]}
+                            content_delta = delta["content"]
+                            if xml_tool_mode:
+                                xml_tool_buffer += content_delta
+                            else:
+                                candidate = xml_marker_probe + content_delta
+                                marker_index = candidate.find(_QWEN_XML_FUNCTION_MARKER)
+                                if marker_index >= 0:
+                                    visible_text = candidate[:marker_index]
+                                    xml_tool_buffer = candidate[marker_index:]
+                                    xml_marker_probe = ""
+                                    xml_tool_mode = True
+                                    if visible_text:
+                                        emitted = True
+                                        yield {"type": "text_delta", "content": visible_text}
+                                else:
+                                    visible_text, xml_marker_probe = _split_qwen_xml_marker(candidate)
+                                    if visible_text:
+                                        emitted = True
+                                        yield {"type": "text_delta", "content": visible_text}
 
                         if delta.get("tool_calls"):
                             item = complete_reasoning_item()
@@ -799,6 +961,24 @@ async def stream_openai_completions(
                                 "output_tokens": raw.get("completion_tokens", 0),
                                 "total_tokens": raw.get("total_tokens", 0),
                             }
+
+                    if xml_tool_mode:
+                        xml_calls, remaining_text = _parse_qwen_xml_tool_calls(xml_tool_buffer)
+                        if xml_calls:
+                            for xml_call in xml_calls:
+                                emitted = True
+                                yield {"type": "tool_call", **xml_call}
+                            if remaining_text:
+                                emitted = True
+                                yield {"type": "text_delta", "content": remaining_text}
+                        else:
+                            # Preserve unfamiliar markup instead of silently dropping it.
+                            emitted = True
+                            yield {"type": "text_delta", "content": xml_tool_buffer}
+                    elif xml_marker_probe:
+                        # It was ordinary text ending in a partial marker.
+                        emitted = True
+                        yield {"type": "text_delta", "content": xml_marker_probe}
 
                     # Emit any remaining reasoning if no usage event was received
                     item = complete_reasoning_item()

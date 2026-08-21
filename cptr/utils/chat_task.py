@@ -78,6 +78,27 @@ logger = logging.getLogger(__name__)
 
 ASK_USER_NAME = "ask_user"
 DEFAULT_AUTO_RESOLUTION_MS = 120_000
+GITHUB_REQUEST_RE = re.compile(r"\bgithub\b|https?://github\.com/", re.IGNORECASE)
+GITHUB_PR_URL_RE = re.compile(
+    r"https?://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/(?P<number>\d+)",
+    re.IGNORECASE,
+)
+GITHUB_REVIEW_REQUEST_RE = re.compile(r"\b(?:review|reviews|feedback)\b", re.IGNORECASE)
+GITHUB_DIFF_REQUEST_RE = re.compile(
+    r"\b(?:diff|changes|changed files|summari[sz]e|what (?:is|it's) (?:trying )?to do)\b",
+    re.IGNORECASE,
+)
+GITHUB_MUTATION_TOOL_RE = re.compile(
+    r"^github_.*(?:create|update|delete|add|remove|merge|close|reopen|approve|"
+    r"comment|write|assign|trigger|run|push|set|mark|unmark|lock|unlock|enable|disable|"
+    r"request_(?:copilot_)?review)",
+    re.IGNORECASE,
+)
+GITHUB_MUTATION_INTENT_RE = re.compile(
+    r"\b(?:create|update|edit|delete|remove|merge|close|reopen|approve|comment|"
+    r"reply|assign|trigger|run|push|set|mark|unmark|lock|unlock|enable|disable)\b",
+    re.IGNORECASE,
+)
 ASK_USER_SCHEMA = {
     "name": ASK_USER_NAME,
     "description": "Ask the user one to three material planning questions and wait for their answers.",
@@ -121,6 +142,39 @@ ASK_USER_SCHEMA = {
         "required": ["questions"],
     },
 }
+
+
+def _is_github_mutation_tool(name: str) -> bool:
+    return bool(GITHUB_MUTATION_TOOL_RE.search(name))
+
+
+def _allows_github_mutation(user_text: str) -> bool:
+    """Only expose GitHub write tools when the user explicitly requests a write."""
+    return bool(GITHUB_MUTATION_INTENT_RE.search(user_text))
+
+
+def _github_review_target(user_text: str) -> dict[str, str | int] | None:
+    """Extract a PR target only for an explicit request to read its review feedback."""
+    match = GITHUB_PR_URL_RE.search(user_text)
+    if not match or not GITHUB_REVIEW_REQUEST_RE.search(user_text):
+        return None
+    return {
+        "owner": match.group("owner"),
+        "repo": match.group("repo"),
+        "pullNumber": int(match.group("number")),
+    }
+
+
+def _github_diff_target(user_text: str) -> dict[str, str | int] | None:
+    """Extract a PR target for a request to summarize its code changes."""
+    match = GITHUB_PR_URL_RE.search(user_text)
+    if not match or not GITHUB_DIFF_REQUEST_RE.search(user_text):
+        return None
+    return {
+        "owner": match.group("owner"),
+        "repo": match.group("repo"),
+        "pullNumber": int(match.group("number")),
+    }
 
 
 def validate_ask_user_request(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1916,7 +1970,67 @@ async def run_chat_task(
             system += f"\n\n[CONVERSATION SUMMARY]\n{loaded_summary}"
         if regeneration_prompt:
             messages.append({"role": "user", "content": regeneration_prompt})
+        latest_user_message = next(
+            (message for message in reversed(messages) if message.get("role") == "user"),
+            None,
+        )
+        latest_user_text = (
+            _plain_message_text(latest_user_message.get("content"))
+            if latest_user_message
+            else ""
+        )
+        github_request = bool(GITHUB_REQUEST_RE.search(latest_user_text))
+        github_mutation_allowed = _allows_github_mutation(latest_user_text)
+        github_review_target = _github_review_target(latest_user_text)
+        github_diff_target = (
+            None if github_review_target else _github_diff_target(latest_user_text)
+        )
+        if github_request:
+            system += (
+                "\n\n[GITHUB SAFETY]\n"
+                "For GitHub review, analysis, search, and information requests, use GitHub "
+                "MCP read tools and report their returned data. Never infer that a proposed "
+                "resolution authorizes a remote change. Only use a GitHub write tool when the "
+                "user explicitly asks to make that specific change; that action will require "
+                "a separate approval. For pull-request review feedback, call "
+                "github_pull_request_read with method get_review_comments before answering."
+            )
+        if github_review_target:
+            system += (
+                " The user has supplied a pull-request URL and asked for its review feedback. "
+                "Call github_pull_request_read exactly once with method get_review_comments. "
+                "After receiving the review threads, answer directly from them: list each "
+                "unresolved comment and provide an implementation plan. Do not search GitHub "
+                "or ask the user to confirm fetching the comments."
+            )
+        if github_diff_target:
+            system += (
+                " The user has supplied a pull-request URL and asked to understand its "
+                "code changes. Call github_pull_request_read exactly once with method "
+                "get_diff. The diff already identifies changed files: do not call get_files "
+                "or read the pull-request description. Then summarize the implementation "
+                "directly from the diff."
+            )
         tools = await get_tool_list(builtin_tools=builtin_tools, workspace=workspace)
+        # The bundled GitHub integration is read-only. Do not expose
+        # mutation schemas to the model; the MCP process independently
+        # enforces the same rule with its --read-only server flag.
+        tools = [tool for tool in tools if not _is_github_mutation_tool(tool["name"])]
+        if github_request and not github_mutation_allowed:
+            # Do not let an analysis request accidentally expose remote write
+            # actions (or a general shell) to the model.
+            tools = [
+                tool
+                for tool in tools
+                if not _is_github_mutation_tool(tool["name"]) and tool["name"] != "run_command"
+            ]
+        if github_review_target:
+            # Qwen frequently calls get_reviews first and then loses the detailed
+            # thread output among unrelated searches. Give this intent one precise
+            # read capability; arguments are canonicalised when it is called below.
+            tools = [tool for tool in tools if tool["name"] == "github_pull_request_read"]
+        if github_diff_target:
+            tools = [tool for tool in tools if tool["name"] == "github_pull_request_read"]
         if not skill_authoring_allowed:
             tools = [t for t in tools if t["name"] != "manage_skill"]
 
@@ -2029,6 +2143,12 @@ async def run_chat_task(
                 should_auto = approval_mode == "full" or (
                     approval_mode == "auto" and tool and tool_approval == "allow"
                 )
+                # External GitHub MCP mutation tools are always an explicit
+                # confirmation boundary. They must never be auto-approved by
+                # the model's tool-approval review, even in full mode.
+                github_mutation = tool is None and _is_github_mutation_tool(name)
+                if github_mutation and not item.get("approved"):
+                    should_auto = False
                 if (
                     not should_auto
                     and approval_mode == "auto"
@@ -2046,7 +2166,7 @@ async def run_chat_task(
                 ):
                     item["approved"] = True
                     should_auto = True
-                needs_approval = not should_auto
+                needs_approval = github_mutation or not should_auto
                 if needs_approval and not item.get("approved"):
                     item["status"] = "pending"
                     await _save_message(
@@ -2286,6 +2406,7 @@ async def run_chat_task(
             restart = False
             pending_calls: list[dict] = []  # Collect tool calls from this response
             pending_call_ids: set[str] = set()
+            github_diff_call_seen = False
             response_reasoning_items: list[dict] = []  # Pair with tool outputs on the next request
             streamed_reasoning_chars = 0
             estimated_prompt_tokens = 0
@@ -2324,6 +2445,20 @@ async def run_chat_task(
                 elif event["type"] == "tool_call":
                     # Collect tool call — don't execute yet
                     call_id = event["call_id"]
+                    if github_review_target and event["name"] != "github_pull_request_read":
+                        logger.warning(
+                            "[task %s] ignored unrelated tool %s during PR review",
+                            message_id[:8],
+                            event["name"],
+                        )
+                        continue
+                    if github_diff_target and event["name"] != "github_pull_request_read":
+                        logger.warning(
+                            "[task %s] ignored unrelated tool %s during PR diff summary",
+                            message_id[:8],
+                            event["name"],
+                        )
+                        continue
                     if call_id in pending_call_ids:
                         logger.warning(
                             "[task %s] ignoring duplicate tool call id=%s name=%s",
@@ -2332,6 +2467,29 @@ async def run_chat_task(
                             event["name"],
                         )
                         continue
+                    if github_review_target and event["name"] == "github_pull_request_read":
+                        event = {
+                            **event,
+                            "arguments": {
+                                **github_review_target,
+                                "method": "get_review_comments",
+                            },
+                        }
+                    if github_diff_target and event["name"] == "github_pull_request_read":
+                        if github_diff_call_seen:
+                            logger.warning(
+                                "[task %s] ignored duplicate PR diff call",
+                                message_id[:8],
+                            )
+                            continue
+                        github_diff_call_seen = True
+                        event = {
+                            **event,
+                            "arguments": {
+                                **github_diff_target,
+                                "method": "get_diff",
+                            },
+                        }
                     pending_call_ids.add(call_id)
                     pending_calls.append(event)
 
