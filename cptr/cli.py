@@ -9,9 +9,7 @@ import uuid
 import click
 import uvicorn
 
-DEFAULT_MANAGED_MODEL_ID = "cptr"
-DEFAULT_MANAGED_MODEL_NAME = "Open WebUI Computer"
-DEFAULT_MANAGED_MODEL_OWNER = "cptr"
+from cptr.utils.managed_model import managed_model_from_environment
 
 
 @click.group()
@@ -93,14 +91,7 @@ def bootstrap(
     password = _required_env(password_env)
     gateway_key = _required_env(gateway_key_env)
     upstream_api_key = os.environ.get(upstream_api_key_env, "")
-    managed_model = {
-        "id": os.environ.get("CPTR_MANAGED_MODEL_ID", DEFAULT_MANAGED_MODEL_ID).strip()
-        or DEFAULT_MANAGED_MODEL_ID,
-        "name": os.environ.get("CPTR_MANAGED_MODEL_NAME", DEFAULT_MANAGED_MODEL_NAME).strip()
-        or DEFAULT_MANAGED_MODEL_NAME,
-        "owner": os.environ.get("CPTR_MANAGED_MODEL_OWNER", DEFAULT_MANAGED_MODEL_OWNER).strip()
-        or DEFAULT_MANAGED_MODEL_OWNER,
-    }
+    managed_model = managed_model_from_environment()
     github_mcp_path = os.environ.get("CPTR_GITHUB_MCP_PATH", "").strip()
     github_mcp_toolsets = os.environ.get(
         "CPTR_GITHUB_MCP_TOOLSETS",

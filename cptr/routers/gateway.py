@@ -33,6 +33,7 @@ from cptr.models import Auth, Chat, ChatMessage, Config
 from cptr.models.workspaces import Workspace
 from cptr.utils.agents.prompts import message_text
 from cptr.utils.config import AuthResult, now_ms
+from cptr.utils.managed_model import normalize_managed_model
 from cptr.utils.runtime import Runtime, FileError
 
 logger = logging.getLogger(__name__)
@@ -44,22 +45,10 @@ CHAT_ID_HEADER = "X-Chat-Id"
 OWUI_CHAT_ID_HEADER = "X-OpenWebUI-Chat-Id"
 OWUI_MESSAGE_ID_HEADER = "X-OpenWebUI-Message-Id"
 OWUI_TASK_HEADER = "X-OpenWebUI-Task"
-DEFAULT_MANAGED_MODEL = {
-    "id": "cptr",
-    "name": "Open WebUI Computer",
-    "owner": "cptr",
-}
-
-
 async def _managed_model() -> dict[str, str]:
     """Load the installer-configured model identity with safe public defaults."""
     configured = await Config.get("gateway.managed_model")
-    if not isinstance(configured, dict):
-        return dict(DEFAULT_MANAGED_MODEL)
-    return {
-        key: str(configured.get(key) or default).strip() or default
-        for key, default in DEFAULT_MANAGED_MODEL.items()
-    }
+    return normalize_managed_model(configured if isinstance(configured, dict) else None)
 
 
 # ── API key management ───────────────────────────────────────
